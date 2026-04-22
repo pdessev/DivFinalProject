@@ -125,6 +125,60 @@ class PerceptualLoss(nn.Module):
         return F.l1_loss(self.feature_extractor(pred), self.feature_extractor(target))
 
 
+class FlowConsistencyLoss(nn.Module):
+    """
+    Forward-backward consistency: flow_0 + warp(flow_1, flow_0) ≈ 0.
+    Following flow_0 from frame_0 to the intermediate frame, then flow_1 back,
+    should return to the origin. Gradient is texture-independent.
+    """
+    def __init__(self):
+        super(FlowConsistencyLoss, self).__init__()
+        self.charb = CharbonnierLoss()
+
+    def _warp(self, flow_to_warp, flow_coords):
+        B, _, H, W = flow_coords.shape
+        xs = torch.arange(W, device=flow_coords.device, dtype=torch.float32)
+        ys = torch.arange(H, device=flow_coords.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        base = torch.stack([grid_x, grid_y], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
+        sampling = base + flow_coords
+        norm_x = 2.0 * sampling[:, 0] / (W - 1) - 1.0
+        norm_y = 2.0 * sampling[:, 1] / (H - 1) - 1.0
+        grid = torch.stack([norm_x, norm_y], dim=-1)
+        return F.grid_sample(flow_to_warp, grid, mode='bilinear',
+                             padding_mode='border', align_corners=True)
+
+    def forward(self, flow_0, flow_1):
+        warped_flow_1 = self._warp(flow_1, flow_0)
+        return self.charb(flow_0 + warped_flow_1, torch.zeros_like(flow_0))
+
+
+class FlowTVLoss(nn.Module):
+    """
+    Total variation on both flow fields. Encourages spatial smoothness,
+    propagating flow estimates from textured edges into smooth interiors.
+    """
+    def forward(self, flow_0, flow_1):
+        def tv(f):
+            return (torch.abs(f[:, :, 1:, :] - f[:, :, :-1, :]).mean() +
+                    torch.abs(f[:, :, :, 1:] - f[:, :, :, :-1]).mean())
+        return tv(flow_0) + tv(flow_1)
+
+
+class FlowSupervisionLoss(nn.Module):
+    """
+    Charbonnier loss between predicted flows and RAFT pseudo-GT flows.
+    Direct flow supervision bypasses the bilinear-sampling gradient dead zone
+    in textureless image regions.
+    """
+    def __init__(self):
+        super(FlowSupervisionLoss, self).__init__()
+        self.charb = CharbonnierLoss()
+
+    def forward(self, flow_0, flow_1, gt_flow_0, gt_flow_1):
+        return self.charb(flow_0, gt_flow_0) + self.charb(flow_1, gt_flow_1)
+
+
 class VFICombinedLoss(nn.Module):
     """
     Combines SSIM, Charbonnier, gradient, warp supervision, and L1 weight regularization.
@@ -133,46 +187,73 @@ class VFICombinedLoss(nn.Module):
     forces each flow to independently match the target before blending, so the model cannot
     collapse to a trivial 0.5/0.5 average of the input frames.
     """
-    def __init__(self, ssim_weight=0.1, charbonnier_weight=0.6,
-                 gradient_weight=0.1, warp_weight=0.2, l1_weight=1e-4,
-                 perceptual_weight=0.01):
+    def __init__(self, ssim_weight=0.1, charbonnier_weight=0.1,
+                 gradient_weight=0.1, warp_weight=0.6, l1_weight=1e-4,
+                 perceptual_weight=0.05, flow_supervision_weight=0.01,
+                 flow_consistency_weight=0.01, flow_tv_weight=0.005):
         super(VFICombinedLoss, self).__init__()
-        self.ssim_loss = SSIMLoss()
-        self.charbonnier_loss = CharbonnierLoss()
-        self.gradient_loss = ImageGradientLoss()
-        self.perceptual_loss = PerceptualLoss()
+        self.ssim_loss             = SSIMLoss()
+        self.charbonnier_loss      = CharbonnierLoss()
+        self.gradient_loss         = ImageGradientLoss()
+        self.perceptual_loss       = PerceptualLoss()
+        self.flow_supervision_loss = FlowSupervisionLoss()
+        self.flow_consistency_loss = FlowConsistencyLoss()
+        self.flow_tv_loss          = FlowTVLoss()
 
-        self.ssim_weight = ssim_weight
-        self.charbonnier_weight = charbonnier_weight
-        self.gradient_weight = gradient_weight
-        self.warp_weight = warp_weight
-        self.l1_weight = l1_weight
-        self.perceptual_weight = perceptual_weight
+        self.ssim_weight              = ssim_weight
+        self.charbonnier_weight       = charbonnier_weight
+        self.gradient_weight          = gradient_weight
+        self.warp_weight              = warp_weight
+        self.l1_weight                = l1_weight
+        self.perceptual_weight        = perceptual_weight
+        self.flow_supervision_weight  = flow_supervision_weight
+        self.flow_consistency_weight  = flow_consistency_weight
+        self.flow_tv_weight           = flow_tv_weight
 
-    def forward(self, pred_frame, target_frame, model_parameters, warped_0=None, warped_1=None):
+    def forward(self, pred_frame, target_frame, model_parameters,
+                warped_0=None, warped_1=None,
+                flow_0=None, flow_1=None,
+                gt_flow_0=None, gt_flow_1=None):
         # 1. Reconstruction losses on the final blended output
         loss_ssim   = self.ssim_loss(pred_frame, target_frame)
         loss_charb  = self.charbonnier_loss(pred_frame, target_frame)
         loss_grad   = self.gradient_loss(pred_frame, target_frame)
         loss_percep = self.perceptual_loss(pred_frame, target_frame)
 
-        # 2. Warp supervision: each individually warped frame must match the target.
-        #    This is the key anti-ghosting term — it cannot be minimized by averaging.
+        # 2. Warp supervision
         loss_warp = torch.tensor(0., device=pred_frame.device)
         if warped_0 is not None and warped_1 is not None:
             loss_warp = (self.charbonnier_loss(warped_0, target_frame) +
                          self.charbonnier_loss(warped_1, target_frame))
 
-        # 3. L1 weight regularization (for future pruning)
+        # 3. RAFT pseudo-GT flow supervision (training only; skipped when gt_flow_* is None)
+        loss_flow_sup = torch.tensor(0., device=pred_frame.device)
+        if flow_0 is not None and gt_flow_0 is not None:
+            loss_flow_sup = self.flow_supervision_loss(flow_0, flow_1, gt_flow_0, gt_flow_1)
+
+        # 4. Forward-backward flow consistency (texture-independent gradient signal)
+        loss_flow_cons = torch.tensor(0., device=pred_frame.device)
+        if flow_0 is not None and flow_1 is not None:
+            loss_flow_cons = self.flow_consistency_loss(flow_0, flow_1)
+
+        # 5. Flow total variation (spatial smoothness)
+        loss_flow_tv = torch.tensor(0., device=pred_frame.device)
+        if flow_0 is not None and flow_1 is not None:
+            loss_flow_tv = self.flow_tv_loss(flow_0, flow_1)
+
+        # 6. L1 weight regularization (for future pruning)
         l1_reg = torch.tensor(0., device=pred_frame.device)
         for param in model_parameters:
             l1_reg += torch.norm(param, p=1)
 
-        total_loss = (self.ssim_weight        * loss_ssim   +
-                      self.charbonnier_weight * loss_charb  +
-                      self.gradient_weight    * loss_grad   +
-                      self.perceptual_weight  * loss_percep +
-                      self.warp_weight        * loss_warp   +
-                      self.l1_weight          * l1_reg)
+        total_loss = (self.ssim_weight             * loss_ssim      +
+                      self.charbonnier_weight       * loss_charb     +
+                      self.gradient_weight          * loss_grad      +
+                      self.perceptual_weight        * loss_percep    +
+                      self.warp_weight              * loss_warp      +
+                      self.flow_supervision_weight  * loss_flow_sup  +
+                      self.flow_consistency_weight  * loss_flow_cons +
+                      self.flow_tv_weight           * loss_flow_tv   +
+                      self.l1_weight                * l1_reg)
 
         return total_loss, loss_ssim, loss_charb, l1_reg

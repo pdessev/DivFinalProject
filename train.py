@@ -10,9 +10,10 @@ from dataset import FullVideoDataset
 from CNNv1 import CNNEncoder, BiConvLSTM, TimeConditionedDecoder
 from warping import WarpingModule
 from loss import VFICombinedLoss
+from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
 
-def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, subsample_factor=10):
+def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, subsample_factor=10, raft_model=None):
     encoder.train()
     lstm.train()
     decoder.train()
@@ -61,6 +62,13 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
 
                 gt_frame = all_frames[:, gt_idx]
 
+                # Compute RAFT pseudo-GT flows (frozen, no_grad — label generation only)
+                gt_flow_0 = gt_flow_1 = None
+                if raft_model is not None:
+                    with torch.no_grad():
+                        gt_flow_0 = raft_model(frame_0 * 2.0 - 1.0, gt_frame * 2.0 - 1.0)[-1]
+                        gt_flow_1 = raft_model(frame_1 * 2.0 - 1.0, gt_frame * 2.0 - 1.0)[-1]
+
                 # t-weighted interpolation of LSTM states and skip connections.
                 # At t=0.5 the decoder receives equal context from both bounding frames;
                 # at t=0.25 it leans toward frame_0; at t=0.75 toward frame_1.
@@ -79,7 +87,10 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
 
                 pred_frame, warped_0, warped_1 = warping_module(frame_0, frame_1, flow_0, flow_1, mask)
 
-                loss, _, _, _ = criterion(pred_frame, gt_frame, all_params, warped_0, warped_1)
+                loss, _, _, _ = criterion(pred_frame, gt_frame, all_params,
+                                          warped_0, warped_1,
+                                          flow_0, flow_1,
+                                          gt_flow_0, gt_flow_1)
                 total_loss = total_loss + loss
                 total_frames_predicted += 1
 
@@ -151,7 +162,9 @@ def validate_one_epoch(encoder, lstm, decoder, warping_module, criterion, datalo
 
                     pred_frame, warped_0, warped_1 = warping_module(frame_0, frame_1, flow_0, flow_1, mask)
 
-                    loss, _, _, _ = criterion(pred_frame, gt_frame, all_params, warped_0, warped_1)
+                    loss, _, _, _ = criterion(pred_frame, gt_frame, all_params,
+                                              warped_0, warped_1,
+                                              flow_0, flow_1)
                     total_loss += loss.item()
                     total_frames_predicted += 1
 
@@ -167,7 +180,7 @@ if __name__ == "__main__":
     NUM_EPOCHS = 20
     LEARNING_RATE = 1e-4
     SUBSAMPLE_FACTOR = 4
-    TRAINING_SET_SIZE = 20
+    TRAINING_SET_SIZE = 80
     
     if torch.backends.mps.is_available():
         print("MPS backend is available. Training will utilize Apple Silicon GPU acceleration.")
@@ -200,22 +213,37 @@ if __name__ == "__main__":
     decoder = TimeConditionedDecoder().to(device)
     warping_module = WarpingModule().to(device)
     
-    criterion = VFICombinedLoss(ssim_weight=0.1, charbonnier_weight=0.1, gradient_weight=0.1, warp_weight=0.6, l1_weight=1e-4, perceptual_weight=0.01).to(device)
-    
+    criterion = VFICombinedLoss(
+        ssim_weight=0.1, charbonnier_weight=0.1, gradient_weight=0.1,
+        warp_weight=0.6, l1_weight=1e-4, perceptual_weight=0.05,
+        flow_supervision_weight=0.01, flow_consistency_weight=0.01,
+        flow_tv_weight=0.005
+    ).to(device)
+
+    # Frozen RAFT model used as a pseudo-GT flow label generator during training.
+    # Weights are downloaded automatically on first run (~20 MB).
+    raft_weights = Raft_Small_Weights.DEFAULT
+    raft_model = raft_small(weights=raft_weights).to(device)
+    raft_model.eval()
+    for param in raft_model.parameters():
+        param.requires_grad = False
+    print("RAFT optical flow model loaded.")
+
     all_params = list(encoder.parameters()) + list(lstm.parameters()) + list(decoder.parameters())
     optimizer = optim.AdamW(all_params, lr=LEARNING_RATE)
 
     best_val_loss = float('inf')
-    
+
     print("\n--- Starting Training Process ---")
 
     try:
         for epoch in range(NUM_EPOCHS):
             print(f"\nEpoch [{epoch+1}/{NUM_EPOCHS}]")
-            
+
             train_loss = train_one_epoch(
                 encoder, lstm, decoder, warping_module, criterion,
-                optimizer, train_loader, device, SUBSAMPLE_FACTOR
+                optimizer, train_loader, device, SUBSAMPLE_FACTOR,
+                raft_model=raft_model
             )
             
             print("   Running Validation...")
