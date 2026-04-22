@@ -1,0 +1,14 @@
+*.zip
+*.rar
+*.tar.gz
+
+__pycache__/*
+*.pyc
+*.pyo
+.DS_Store
+
+.vscode/*
+KoNViD_1k_videos/*
+
+*.mp4
+*.pth
