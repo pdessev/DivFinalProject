@@ -7,6 +7,7 @@ from dataset import FullVideoDataset
 from CNNv1 import CNNEncoder, BiConvLSTM, TimeConditionedDecoder
 from warping import WarpingModule
 
+USE_INTERRUPT = True  # Set to False to load the "best" models instead of "interrupt" models
 
 # -----------------------------
 # Model Loading
@@ -174,21 +175,22 @@ def run_inference_on_video(
 if __name__ == "__main__":
 
     if torch.backends.mps.is_available():
-        print("MPS backend is available. Training will utilize Apple Silicon GPU acceleration.")
+        print("MPS backend is available. Inferencing will utilize Apple Silicon GPU acceleration.")
         DEVICE = torch.device("mps")
     elif torch.cuda.is_available():
-        print("CUDA backend is available. Training will utilize NVIDIA GPU acceleration.")
+        print("CUDA backend is available. Inferencing will utilize NVIDIA GPU acceleration.")
         DEVICE = torch.device("cuda")
     else:
-        print("No GPU acceleration available. Training will run on CPU, which may be very slow.")
+        print("No GPU acceleration available. Inferencing will run on CPU, which may be very slow.")
         DEVICE = torch.device("cpu")
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
+    encoder_prefix = "best" if USE_INTERRUPT else "interrupt"
+    
     VIDEO_DIR = os.path.join(BASE_DIR, "KoNViD_1k_videos")
-    ENCODER_PATH = os.path.join(BASE_DIR, "best_encoder.pth")
-    LSTM_PATH = os.path.join(BASE_DIR, "best_lstm.pth")
-    DECODER_PATH = os.path.join(BASE_DIR, "best_decoder.pth")
+    ENCODER_PATH = os.path.join(BASE_DIR, f"{encoder_prefix}_encoder.pth")
+    LSTM_PATH = os.path.join(BASE_DIR, f"{encoder_prefix}_lstm.pth")
+    DECODER_PATH = os.path.join(BASE_DIR, f"{encoder_prefix}_decoder.pth")
     VIDEO_NAME = "9908050493.mp4"
 
     SUBSAMPLE_FACTOR = 2
