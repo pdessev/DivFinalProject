@@ -178,6 +178,22 @@ class FlowSupervisionLoss(nn.Module):
     def forward(self, flow_0, flow_1, gt_flow_0, gt_flow_1):
         return self.charb(flow_0, gt_flow_0) + self.charb(flow_1, gt_flow_1)
 
+def motion_weight(frame_0, frame_1, target, frame_0_idx, target_idx, frame_1_idx, alpha = 1e-12):
+    initial_num = torch.sum((target - frame_0) ** 2)
+    final_num = torch.sum((target - frame_1) ** 2)
+    
+    initial_denom = (target_idx - frame_0_idx) ** 2
+    final_denom = (frame_1_idx - target_idx) ** 2
+    
+    a = alpha * (initial_num / initial_denom) + (final_num / final_denom)
+    ret = 0.5 + torch.log(a + 1)
+    print(f"{ret.item():.3f}")
+    if ret > 10.0:
+        print(f"Motion weight is above 10: {ret.item():.3f}")
+    if ret < 0.51:
+        print(f"Motion weight is below 0.51: {ret.item():.3f}")
+        
+    return ret
 
 class VFICombinedLoss(nn.Module):
     """
@@ -209,15 +225,17 @@ class VFICombinedLoss(nn.Module):
         self.flow_consistency_weight  = flow_consistency_weight
         self.flow_tv_weight           = flow_tv_weight
 
-    def forward(self, pred_frame, target_frame,
+    def forward(self, pred_frame, target_frame, target_idx=None,
                 warped_0=None, warped_1=None,
                 flow_0=None, flow_1=None,
-                gt_flow_0=None, gt_flow_1=None):
+                gt_flow_0=None, gt_flow_1=None,
+                frame_0=None, frame_1=None,
+                frame_0_idx=None, frame_1_idx=None):
         # 1. Reconstruction losses on the final blended output
         loss_ssim   = self.ssim_loss(pred_frame, target_frame)
         loss_charb  = self.charbonnier_loss(pred_frame, target_frame)
         loss_grad   = self.gradient_loss(pred_frame, target_frame)
-        loss_percep = self.perceptual_loss(pred_frame, target_frame)
+        # loss_percep = self.perceptual_loss(pred_frame, target_frame)
 
         # 2. Warp supervision
         loss_warp = torch.tensor(0., device=pred_frame.device)
@@ -226,9 +244,9 @@ class VFICombinedLoss(nn.Module):
                          self.charbonnier_loss(warped_1, target_frame))
 
         # 3. RAFT pseudo-GT flow supervision (training only; skipped when gt_flow_* is None)
-        loss_flow_sup = torch.tensor(0., device=pred_frame.device)
-        if flow_0 is not None and gt_flow_0 is not None:
-            loss_flow_sup = self.flow_supervision_loss(flow_0, flow_1, gt_flow_0, gt_flow_1)
+        # loss_flow_sup = torch.tensor(0., device=pred_frame.device)
+        # if flow_0 is not None and gt_flow_0 is not None:
+        #     loss_flow_sup = self.flow_supervision_loss(flow_0, flow_1, gt_flow_0, gt_flow_1)
 
         # 4. Forward-backward flow consistency (texture-independent gradient signal)
         loss_flow_cons = torch.tensor(0., device=pred_frame.device)
@@ -236,17 +254,20 @@ class VFICombinedLoss(nn.Module):
             loss_flow_cons = self.flow_consistency_loss(flow_0, flow_1)
 
         # 5. Flow total variation (spatial smoothness)
-        loss_flow_tv = torch.tensor(0., device=pred_frame.device)
-        if flow_0 is not None and flow_1 is not None:
-            loss_flow_tv = self.flow_tv_loss(flow_0, flow_1)
+        # loss_flow_tv = torch.tensor(0., device=pred_frame.device)
+        # if flow_0 is not None and flow_1 is not None:
+        #     loss_flow_tv = self.flow_tv_loss(flow_0, flow_1)
 
-        total_loss = (self.ssim_weight             * loss_ssim      +
+        loss_multiplier = motion_weight(frame_0, frame_1, target_frame, frame_0_idx, target_idx, frame_1_idx) if None not in [frame_0, frame_1, target_frame, frame_0_idx, target_idx, frame_1_idx] else 1.0
+
+        total_loss = loss_multiplier * \
+                     (self.ssim_weight             * loss_ssim      +
                       self.charbonnier_weight       * loss_charb     +
                       self.gradient_weight          * loss_grad      +
-                      self.perceptual_weight        * loss_percep    +
+                    #   self.perceptual_weight        * loss_percep    +
                       self.warp_weight              * loss_warp      +
-                      self.flow_supervision_weight  * loss_flow_sup  +
-                      self.flow_consistency_weight  * loss_flow_cons +
-                      self.flow_tv_weight           * loss_flow_tv)
+                    #   self.flow_supervision_weight  * loss_flow_sup  +
+                      self.flow_consistency_weight  * loss_flow_cons)
+                    #   self.flow_tv_weight           * loss_flow_tv)
 
         return total_loss, loss_ssim, loss_charb, torch.zeros(1, device=pred_frame.device)

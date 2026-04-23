@@ -17,7 +17,15 @@ from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 # Number of predicted frames to accumulate per backward pass.
 # Lower = less memory, more LSTM backward passes (slower).
 # Higher = more memory, fewer LSTM backward passes (faster).
-BACKWARD_CHUNK_SIZE = 45
+BACKWARD_CHUNK_SIZE = 70
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_DIR = os.path.join(BASE_DIR, "KoNViD_1k_videos")
+NUM_EPOCHS = 1
+LEARNING_RATE = 1e-4
+SUBSAMPLE_FACTOR = 2
+TRAINING_SET_SIZE = 20
+RESOLUTION = (512, 288)  # (width, height)
 
 def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, scaler=None, subsample_factor=10, raft_model=None, flow_cache_dir=None):
     encoder.train()
@@ -35,7 +43,7 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
     for batch_idx, (context_frames, all_frames, video_filenames) in enumerate(dataloader):
         context_frames = context_frames.to(device)
         all_frames = all_frames.to(device)
-
+        print(f"Video name: {video_filenames[0]} | Context frames shape: {context_frames.shape} | All frames shape: {all_frames.shape}")
         # Load precomputed RAFT flows for this video (if the cache exists)
         precomp_flows = None
         if flow_cache_dir is not None:
@@ -127,11 +135,13 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
                         mask   = F.interpolate(mask,   size=frame_0.shape[2:], mode='bilinear', align_corners=False)
 
                     pred_frame, warped_0, warped_1 = warping_module(frame_0, frame_1, flow_0, flow_1, mask)
-
-                    loss, _, _, _ = criterion(pred_frame, gt_frame,
-                                              warped_0, warped_1,
-                                              flow_0, flow_1,
-                                              gt_flow_0, gt_flow_1)
+                    loss, _, _, _ = criterion(pred_frame, gt_frame, target_idx=gt_idx,
+                                              warped_0=warped_0, warped_1=warped_1,
+                                              flow_0=flow_0, flow_1=flow_1,
+                                              gt_flow_0=gt_flow_0, gt_flow_1=gt_flow_1,
+                                              frame_0=frame_0, frame_1=frame_1,
+                                              frame_0_idx=interval * subsample_factor,
+                                              frame_1_idx=(interval + 1) * subsample_factor)
 
                 chunk_loss = chunk_loss + loss / n_frames
                 total_loss_item += loss.item()
@@ -220,7 +230,9 @@ def validate_one_epoch(encoder, lstm, decoder, warping_module, criterion, datalo
 
                     loss, _, _, _ = criterion(pred_frame, gt_frame,
                                               warped_0, warped_1,
-                                              flow_0, flow_1)
+                                              flow_0, flow_1,
+                                              frame_0, frame_1,
+                                              frame_0_idx=interval * subsample_factor, target_idx=gt_idx, frame_1_idx=(interval + 1) * subsample_factor)
                     total_loss += loss.item()
                     total_frames_predicted += 1
 
@@ -230,15 +242,7 @@ def validate_one_epoch(encoder, lstm, decoder, warping_module, criterion, datalo
     return running_loss / len(dataloader)
 
 
-if __name__ == "__main__":
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    VIDEO_DIR = os.path.join(BASE_DIR, "KoNViD_1k_videos")
-    NUM_EPOCHS = 20
-    LEARNING_RATE = 1e-4
-    SUBSAMPLE_FACTOR = 4
-    TRAINING_SET_SIZE = 80
-    RESOLUTION = (512, 288)  # (width, height)
-    
+if __name__ == "__main__":    
     if torch.backends.mps.is_available():
         print("MPS backend is available. Training will utilize Apple Silicon GPU acceleration.")
         device = torch.device("mps")
@@ -272,10 +276,10 @@ if __name__ == "__main__":
     warping_module = WarpingModule().to(device)
     
     criterion = VFICombinedLoss(
-        ssim_weight=0.1, charbonnier_weight=0.1, gradient_weight=0.1,
-        warp_weight=0.6, perceptual_weight=0.05,
-        flow_supervision_weight=0.01, flow_consistency_weight=0.01,
-        flow_tv_weight=0.005
+        ssim_weight=0.05, charbonnier_weight=0.05, gradient_weight=0.1,
+        warp_weight=0.6, perceptual_weight=0.00,
+        flow_supervision_weight=0.00, flow_consistency_weight=0.2,
+        flow_tv_weight=0.000
     ).to(device)
 
     # Use precomputed RAFT flows if available; otherwise run RAFT live during training.
@@ -327,7 +331,10 @@ if __name__ == "__main__":
                 torch.save(lstm.state_dict(), os.path.join(BASE_DIR, "best_lstm.pth"))
                 torch.save(decoder.state_dict(), os.path.join(BASE_DIR, "best_decoder.pth"))
 
-    except KeyboardInterrupt:
+    except Exception as e:
+        print(f"\nTraining interrupted due to exception: {e}")
+    # except KeyboardInterrupt:
+        print("Saving current model weights before exiting...")
         torch.save(encoder.state_dict(), os.path.join(BASE_DIR, "interrupted_encoder.pth"))
         torch.save(lstm.state_dict(), os.path.join(BASE_DIR, "interrupted_lstm.pth"))
         torch.save(decoder.state_dict(), os.path.join(BASE_DIR, "interrupted_decoder.pth"))

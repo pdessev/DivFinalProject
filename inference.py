@@ -55,7 +55,7 @@ def run_inference_on_video(
 ):
 
     dataset = FullVideoDataset(video_dir, [video_name], subsample_factor)
-    context_frames, all_frames = dataset[0]
+    context_frames, all_frames, file_names = dataset[0]
 
     context_frames = context_frames.unsqueeze(0).to(device)  # [1,T,C,H,W]
     all_frames = all_frames.unsqueeze(0).to(device)
@@ -185,7 +185,7 @@ if __name__ == "__main__":
         DEVICE = torch.device("cpu")
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    encoder_prefix = "best" if USE_INTERRUPT else "interrupt"
+    encoder_prefix = "interrupted" if USE_INTERRUPT else "best"
     
     VIDEO_DIR = os.path.join(BASE_DIR, "KoNViD_1k_videos")
     ENCODER_PATH = os.path.join(BASE_DIR, f"{encoder_prefix}_encoder.pth")
