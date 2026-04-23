@@ -1,5 +1,6 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import time
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -15,7 +16,7 @@ from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 # Number of predicted frames to accumulate per backward pass.
 # Lower = less memory, more LSTM backward passes (slower).
 # Higher = more memory, fewer LSTM backward passes (faster).
-BACKWARD_CHUNK_SIZE = 50
+BACKWARD_CHUNK_SIZE = 55
 
 
 def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, scaler=None, subsample_factor=10, raft_model=None):
@@ -25,7 +26,13 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
     
     running_loss = 0.0
     all_params = list(encoder.parameters()) + list(lstm.parameters()) + list(decoder.parameters())
-    
+
+    RATE_REPORT_INTERVAL = 1.0  # seconds
+    _rate_t0 = time.monotonic()
+    _rate_cycles = 0
+    _total_t0 = time.monotonic()
+    _total_frames = 0
+
     for batch_idx, (context_frames, all_frames) in enumerate(dataloader):
         context_frames = context_frames.to(device)
         all_frames = all_frames.to(device)
@@ -106,6 +113,17 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
 
                 chunk_loss = chunk_loss + loss / n_frames
                 total_loss_item += loss.item()
+
+                _rate_cycles += 1
+                _total_frames += 1
+                _elapsed = time.monotonic() - _rate_t0
+                if _elapsed >= RATE_REPORT_INTERVAL:
+                    rate = _rate_cycles / _elapsed * 60.0
+                    total_elapsed = time.monotonic() - _total_t0
+                    avg_s_per_frame = total_elapsed / _total_frames
+                    print(f"   Rate: {rate:.1f} frames/min  |  Total: {_total_frames} frames in {total_elapsed:.1f}s  ({avg_s_per_frame:.2f} s/frame avg)")
+                    _rate_t0 = time.monotonic()
+                    _rate_cycles = 0
 
             if scaler is not None:
                 scaler.scale(chunk_loss).backward(retain_graph=not is_last_chunk)
