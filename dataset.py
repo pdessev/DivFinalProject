@@ -48,4 +48,4 @@ class FullVideoDataset(Dataset):
         all_frames = torch.stack(frames)
         context_frames = all_frames[::self.subsample_factor]
         
-        return context_frames, all_frames
+        return context_frames, all_frames, self.video_filenames[idx]

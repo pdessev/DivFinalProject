@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _cp
 
 class DecoderBlock(nn.Module):
     """
@@ -56,10 +57,15 @@ class TimeConditionedDecoder(nn.Module):
         # Final output layer: 32 channels -> 5 channels (Flow x2, Flow y2, Mask x1)
         self.final_conv = nn.Conv2d(32, 5, kernel_size=3, padding=1)
 
+        self.use_checkpoint = False
+
     def forward(self, lstm_features, skip_connections, t):
-        # lstm_features shape: [Batch, 256, 68, 120]
-        # skip_connections: [f1, f2, f3]
-        f1, f2, f3 = skip_connections
+        if self.use_checkpoint and self.training:
+            f1, f2, f3 = skip_connections
+            return _cp(self._forward_impl, lstm_features, f1, f2, f3, t, use_reentrant=False)
+        return self._forward_impl(lstm_features, *skip_connections, t)
+
+    def _forward_impl(self, lstm_features, f1, f2, f3, t):
         b, c, h, w = lstm_features.size()
         
         # 1. Spatially expand time 't' and concatenate

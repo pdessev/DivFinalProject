@@ -188,7 +188,7 @@ class VFICombinedLoss(nn.Module):
     collapse to a trivial 0.5/0.5 average of the input frames.
     """
     def __init__(self, ssim_weight=0.1, charbonnier_weight=0.1,
-                 gradient_weight=0.1, warp_weight=0.6, l1_weight=1e-4,
+                 gradient_weight=0.1, warp_weight=0.6,
                  perceptual_weight=0.05, flow_supervision_weight=0.01,
                  flow_consistency_weight=0.01, flow_tv_weight=0.005):
         super(VFICombinedLoss, self).__init__()
@@ -204,13 +204,12 @@ class VFICombinedLoss(nn.Module):
         self.charbonnier_weight       = charbonnier_weight
         self.gradient_weight          = gradient_weight
         self.warp_weight              = warp_weight
-        self.l1_weight                = l1_weight
         self.perceptual_weight        = perceptual_weight
         self.flow_supervision_weight  = flow_supervision_weight
         self.flow_consistency_weight  = flow_consistency_weight
         self.flow_tv_weight           = flow_tv_weight
 
-    def forward(self, pred_frame, target_frame, model_parameters,
+    def forward(self, pred_frame, target_frame,
                 warped_0=None, warped_1=None,
                 flow_0=None, flow_1=None,
                 gt_flow_0=None, gt_flow_1=None):
@@ -241,11 +240,6 @@ class VFICombinedLoss(nn.Module):
         if flow_0 is not None and flow_1 is not None:
             loss_flow_tv = self.flow_tv_loss(flow_0, flow_1)
 
-        # 6. L1 weight regularization (for future pruning)
-        l1_reg = torch.tensor(0., device=pred_frame.device)
-        for param in model_parameters:
-            l1_reg += torch.norm(param, p=1)
-
         total_loss = (self.ssim_weight             * loss_ssim      +
                       self.charbonnier_weight       * loss_charb     +
                       self.gradient_weight          * loss_grad      +
@@ -253,7 +247,6 @@ class VFICombinedLoss(nn.Module):
                       self.warp_weight              * loss_warp      +
                       self.flow_supervision_weight  * loss_flow_sup  +
                       self.flow_consistency_weight  * loss_flow_cons +
-                      self.flow_tv_weight           * loss_flow_tv   +
-                      self.l1_weight                * l1_reg)
+                      self.flow_tv_weight           * loss_flow_tv)
 
-        return total_loss, loss_ssim, loss_charb, l1_reg
+        return total_loss, loss_ssim, loss_charb, torch.zeros(1, device=pred_frame.device)

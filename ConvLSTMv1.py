@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as _cp
 
 class ConvLSTMCell(nn.Module):
     """
@@ -52,11 +53,12 @@ class BiConvLSTM(nn.Module):
     """
     Processes a sequence of spatial features forwards and backwards.
     """
-    def __init__(self, input_dim, hidden_dim, kernel_size=3):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3, use_checkpoint=False):
         super(BiConvLSTM, self).__init__()
         
-        self.forward_cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
-        self.backward_cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.forward_cell    = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.backward_cell   = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.use_checkpoint  = use_checkpoint
 
     def forward(self, x):
         # x shape expects: [Batch, Sequence_Length, Channels, Height, Width]
@@ -71,12 +73,18 @@ class BiConvLSTM(nn.Module):
         
         # Forward pass
         for t in range(seq_len):
-            h_f, c_f = self.forward_cell(x[:, t, :, :, :], (h_f, c_f))
+            if self.use_checkpoint and self.training:
+                h_f, c_f = _cp(self.forward_cell, x[:, t, :, :, :], (h_f, c_f), use_reentrant=False)
+            else:
+                h_f, c_f = self.forward_cell(x[:, t, :, :, :], (h_f, c_f))
             forward_outputs.append(h_f)
             
         # Backward pass
         for t in range(seq_len - 1, -1, -1):
-            h_b, c_b = self.backward_cell(x[:, t, :, :, :], (h_b, c_b))
+            if self.use_checkpoint and self.training:
+                h_b, c_b = _cp(self.backward_cell, x[:, t, :, :, :], (h_b, c_b), use_reentrant=False)
+            else:
+                h_b, c_b = self.backward_cell(x[:, t, :, :, :], (h_b, c_b))
             # Insert at the beginning so the time indices align with forward_outputs
             backward_outputs.insert(0, h_b)
             

@@ -118,7 +118,7 @@ class WarpingModule(nn.Module):
         # Perform the actual differentiable sampling
         # padding_mode='border' duplicates the edge pixels if the flow looks out of bounds
         # New line
-        if img.is_cuda and img.get_device() == torch.device("mps"):
+        if img.device.type == 'mps':
             # Use the custom MPS-safe grid sampling function
             warped_img = mps_safe_grid_sample(img, normalized_grid)
         else:

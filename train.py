@@ -5,6 +5,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+from pathlib import Path
 
 # Import your custom modules
 from dataset import FullVideoDataset
@@ -16,16 +17,14 @@ from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 # Number of predicted frames to accumulate per backward pass.
 # Lower = less memory, more LSTM backward passes (slower).
 # Higher = more memory, fewer LSTM backward passes (faster).
-BACKWARD_CHUNK_SIZE = 55
+BACKWARD_CHUNK_SIZE = 45
 
-
-def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, scaler=None, subsample_factor=10, raft_model=None):
+def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer, dataloader, device, scaler=None, subsample_factor=10, raft_model=None, flow_cache_dir=None):
     encoder.train()
     lstm.train()
     decoder.train()
     
     running_loss = 0.0
-    all_params = list(encoder.parameters()) + list(lstm.parameters()) + list(decoder.parameters())
 
     RATE_REPORT_INTERVAL = 1.0  # seconds
     _rate_t0 = time.monotonic()
@@ -33,17 +32,25 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
     _total_t0 = time.monotonic()
     _total_frames = 0
 
-    for batch_idx, (context_frames, all_frames) in enumerate(dataloader):
+    for batch_idx, (context_frames, all_frames, video_filenames) in enumerate(dataloader):
         context_frames = context_frames.to(device)
         all_frames = all_frames.to(device)
-        
+
+        # Load precomputed RAFT flows for this video (if the cache exists)
+        precomp_flows = None
+        if flow_cache_dir is not None:
+            cache_path = os.path.join(flow_cache_dir, Path(video_filenames[0]).stem + ".pt")
+            if os.path.isfile(cache_path):
+                precomp_flows = torch.load(cache_path, map_location="cpu", weights_only=False)
+
         optimizer.zero_grad()
             
         seq_len = context_frames.size(1)
         lstm_inputs = []
         skips_list = []
 
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
+        _autocast_dtype = torch.bfloat16 if device.type == 'mps' else torch.float16
+        with torch.autocast(device_type=device.type, dtype=_autocast_dtype, enabled=(device.type in ('cuda', 'mps'))):
             # 1. Run the FULL sequence through the CNN Encoder
             for i in range(seq_len):
                 features, f1, f2, f3 = encoder(context_frames[:, i])
@@ -70,6 +77,19 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
         if n_frames == 0:
             continue
 
+        # Pre-interpolate lstm states and skip connections for every predicted frame
+        # (amortised: computed once here instead of repeatedly inside the chunk loop).
+        precomp_states = {}
+        precomp_skips  = {}
+        for (interval, offset, t_val, _) in frames_to_predict:
+            precomp_states[(interval, offset)] = (
+                (1.0 - t_val) * lstm_outputs[:, interval] + t_val * lstm_outputs[:, interval + 1]
+            )
+            precomp_skips[(interval, offset)] = [
+                (1.0 - t_val) * skips_list[interval][s] + t_val * skips_list[interval + 1][s]
+                for s in range(3)
+            ]
+
         # 4. Chunked backward: accumulate loss over BACKWARD_CHUNK_SIZE frames,
         #    then backward with retain_graph=True (keep LSTM graph alive between
         #    chunks). The final chunk uses retain_graph=False to release it.
@@ -84,18 +104,20 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
                 frame_1 = context_frames[:, interval + 1]
                 gt_frame = all_frames[:, gt_idx]
 
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
+                with torch.autocast(device_type=device.type, dtype=_autocast_dtype, enabled=(device.type in ('cuda', 'mps'))):
+                    # Use precomputed flows; fall back to live RAFT only if no cache.
                     gt_flow_0 = gt_flow_1 = None
-                    if raft_model is not None:
+                    if precomp_flows is not None and (interval, offset) in precomp_flows:
+                        f0_cpu, f1_cpu = precomp_flows[(interval, offset)]
+                        gt_flow_0 = f0_cpu.unsqueeze(0).to(device)
+                        gt_flow_1 = f1_cpu.unsqueeze(0).to(device)
+                    elif raft_model is not None:
                         with torch.no_grad():
                             gt_flow_0 = raft_model(frame_0 * 2.0 - 1.0, gt_frame * 2.0 - 1.0)[-1]
                             gt_flow_1 = raft_model(frame_1 * 2.0 - 1.0, gt_frame * 2.0 - 1.0)[-1]
 
-                    lstm_state = (1.0 - t_val) * lstm_outputs[:, interval] + t_val * lstm_outputs[:, interval + 1]
-                    skips = [
-                        (1.0 - t_val) * skips_list[interval][s] + t_val * skips_list[interval + 1][s]
-                        for s in range(3)
-                    ]
+                    lstm_state = precomp_states[(interval, offset)]
+                    skips      = precomp_skips[(interval, offset)]
 
                     flow_0, flow_1, mask = decoder(lstm_state, skips, t_val)
 
@@ -106,7 +128,7 @@ def train_one_epoch(encoder, lstm, decoder, warping_module, criterion, optimizer
 
                     pred_frame, warped_0, warped_1 = warping_module(frame_0, frame_1, flow_0, flow_1, mask)
 
-                    loss, _, _, _ = criterion(pred_frame, gt_frame, all_params,
+                    loss, _, _, _ = criterion(pred_frame, gt_frame,
                                               warped_0, warped_1,
                                               flow_0, flow_1,
                                               gt_flow_0, gt_flow_1)
@@ -148,10 +170,8 @@ def validate_one_epoch(encoder, lstm, decoder, warping_module, criterion, datalo
     decoder.eval()
     
     running_loss = 0.0
-    all_params = list(encoder.parameters()) + list(lstm.parameters()) + list(decoder.parameters())
-    
     with torch.no_grad():
-        for batch_idx, (context_frames, all_frames) in enumerate(dataloader):
+        for batch_idx, (context_frames, all_frames, _video_filenames) in enumerate(dataloader):
             context_frames = context_frames.to(device)
             all_frames = all_frames.to(device)
             
@@ -198,7 +218,7 @@ def validate_one_epoch(encoder, lstm, decoder, warping_module, criterion, datalo
 
                     pred_frame, warped_0, warped_1 = warping_module(frame_0, frame_1, flow_0, flow_1, mask)
 
-                    loss, _, _, _ = criterion(pred_frame, gt_frame, all_params,
+                    loss, _, _, _ = criterion(pred_frame, gt_frame,
                                               warped_0, warped_1,
                                               flow_0, flow_1)
                     total_loss += loss.item()
@@ -246,29 +266,37 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
     encoder = CNNEncoder().to(device)
-    lstm = BiConvLSTM(input_dim=256, hidden_dim=128).to(device)
+    lstm = BiConvLSTM(input_dim=256, hidden_dim=128, use_checkpoint=True).to(device)
     decoder = TimeConditionedDecoder().to(device)
+    decoder.use_checkpoint = True
     warping_module = WarpingModule().to(device)
     
     criterion = VFICombinedLoss(
         ssim_weight=0.1, charbonnier_weight=0.1, gradient_weight=0.1,
-        warp_weight=0.6, l1_weight=1e-4, perceptual_weight=0.05,
+        warp_weight=0.6, perceptual_weight=0.05,
         flow_supervision_weight=0.01, flow_consistency_weight=0.01,
         flow_tv_weight=0.005
     ).to(device)
 
-    # Frozen RAFT model used as a pseudo-GT flow label generator during training.
-    # Weights are downloaded automatically on first run (~20 MB).
-    raft_weights = Raft_Small_Weights.DEFAULT
-    raft_model = raft_small(weights=raft_weights).to(device)
-    raft_model.eval()
-    for param in raft_model.parameters():
-        param.requires_grad = False
-    print("RAFT optical flow model loaded.")
+    # Use precomputed RAFT flows if available; otherwise run RAFT live during training.
+    # Run  python precompute_flows.py  once to build the cache and skip RAFT at train time.
+    FLOW_CACHE_DIR = os.path.join(BASE_DIR, "flows_cache")
+    _cache_populated = os.path.isdir(FLOW_CACHE_DIR) and bool(os.listdir(FLOW_CACHE_DIR))
+    if _cache_populated:
+        raft_model = None
+        print(f"Using precomputed RAFT flows from: {FLOW_CACHE_DIR}")
+    else:
+        raft_weights = Raft_Small_Weights.DEFAULT
+        raft_model = raft_small(weights=raft_weights).to(device)
+        raft_model.eval()
+        for param in raft_model.parameters():
+            param.requires_grad = False
+        print("RAFT optical flow model loaded (run precompute_flows.py to cache flows and skip this).")
 
     all_params = list(encoder.parameters()) + list(lstm.parameters()) + list(decoder.parameters())
-    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE)
-    scaler = torch.amp.GradScaler() if device.type == 'cuda' else None
+    optimizer  = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-4)
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    scaler     = torch.amp.GradScaler() if device.type == 'cuda' else None
 
     best_val_loss = float('inf')
 
@@ -281,7 +309,7 @@ if __name__ == "__main__":
             train_loss = train_one_epoch(
                 encoder, lstm, decoder, warping_module, criterion,
                 optimizer, train_loader, device, scaler, SUBSAMPLE_FACTOR,
-                raft_model=raft_model
+                raft_model=raft_model, flow_cache_dir=FLOW_CACHE_DIR
             )
             
             print("   Running Validation...")
@@ -290,7 +318,8 @@ if __name__ == "__main__":
                 val_loader, device, SUBSAMPLE_FACTOR
             )
             
-            print(f"   => Epoch {epoch+1}: Train = {train_loss:.4f} | Val = {val_loss:.4f}")
+            scheduler.step()
+            print(f"   => Epoch {epoch+1}: Train = {train_loss:.4f} | Val = {val_loss:.4f} | LR = {scheduler.get_last_lr()[0]:.2e}")
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss

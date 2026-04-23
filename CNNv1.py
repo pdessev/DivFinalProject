@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _cp
 
 class ResBlock(nn.Module):
     """
@@ -147,11 +148,12 @@ class BiConvLSTM(nn.Module):
     """
     Processes a sequence of spatial features forwards and backwards.
     """
-    def __init__(self, input_dim, hidden_dim, kernel_size=3):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3, use_checkpoint=False):
         super(BiConvLSTM, self).__init__()
         
-        self.forward_cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
-        self.backward_cell = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.forward_cell    = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.backward_cell   = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
+        self.use_checkpoint  = use_checkpoint
 
     def forward(self, x):
         # x shape expects: [Batch, Sequence_Length, Channels, Height, Width]
@@ -166,12 +168,18 @@ class BiConvLSTM(nn.Module):
         
         # Forward pass
         for t in range(seq_len):
-            h_f, c_f = self.forward_cell(x[:, t, :, :, :], (h_f, c_f))
+            if self.use_checkpoint and self.training:
+                h_f, c_f = _cp(self.forward_cell, x[:, t, :, :, :], (h_f, c_f), use_reentrant=False)
+            else:
+                h_f, c_f = self.forward_cell(x[:, t, :, :, :], (h_f, c_f))
             forward_outputs.append(h_f)
             
         # Backward pass
         for t in range(seq_len - 1, -1, -1):
-            h_b, c_b = self.backward_cell(x[:, t, :, :, :], (h_b, c_b))
+            if self.use_checkpoint and self.training:
+                h_b, c_b = _cp(self.backward_cell, x[:, t, :, :, :], (h_b, c_b), use_reentrant=False)
+            else:
+                h_b, c_b = self.backward_cell(x[:, t, :, :, :], (h_b, c_b))
             # Insert at the beginning so the time indices align with forward_outputs
             backward_outputs.insert(0, h_b)
             
@@ -277,10 +285,16 @@ class TimeConditionedDecoder(nn.Module):
         # 32 channels -> 5 output channels: (flow_0 x2, flow_1 x2, mask x1)
         self.final_conv = nn.Conv2d(32, 5, kernel_size=3, padding=1)
 
+        self.use_checkpoint = False
+
     def forward(self, lstm_features, skip_connections, t):
+        if self.use_checkpoint and self.training:
+            f1, f2, f3 = skip_connections
+            return _cp(self._forward_impl, lstm_features, f1, f2, f3, t, use_reentrant=False)
+        return self._forward_impl(lstm_features, *skip_connections, t)
+
+    def _forward_impl(self, lstm_features, f1, f2, f3, t):
         # lstm_features: [Batch, 256, 65, 120]  (t-interpolated between interval and interval+1)
-        # skip_connections: [f1, f2, f3]         (t-interpolated at each scale)
-        f1, f2, f3 = skip_connections
         b, c, h, w = lstm_features.size()
 
         # 1. Broadcast scalar t into a spatial map and concatenate
