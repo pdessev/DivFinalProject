@@ -9,7 +9,7 @@ class FullVideoDataset(Dataset):
     Reads an entire video into memory, resizing frames on the fly to accelerate training.
     Yields the full sequence of subsampled context frames for the LSTM.
     """
-    def __init__(self, video_dir, video_filenames, subsample_factor=10, resize_dims=(960, 520)):
+    def __init__(self, video_dir, video_filenames, subsample_factor=10, resize_dims=(960, 540)):
         self.video_dir = video_dir
         self.video_filenames = video_filenames
         self.subsample_factor = subsample_factor
